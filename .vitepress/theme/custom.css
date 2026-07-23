@@ -1,0 +1,41 @@
+/* ============================================================
+   全宽阅读模式（html.wide-mode，由导航栏"全宽"开关切换）
+   —— 收起左侧章节目录 + 右侧页内目录，正文铺满可用宽度
+   ============================================================ */
+html.wide-mode {
+  --vp-sidebar-width: 0px;
+}
+html.wide-mode .VPSidebar {
+  display: none !important;
+}
+html.wide-mode .VPDocAside {
+  display: none !important;
+}
+html.wide-mode .VPDoc.has-aside .content-container {
+  max-width: 100% !important;
+}
+
+@media (min-width: 960px) {
+  html.wide-mode .VPContent.has-sidebar {
+    padding-left: 0 !important;
+  }
+}
+@media (min-width: 1440px) {
+  /* 默认在大屏会按 layout-max-width 居中留白，全宽模式改成贴边小留白 */
+  html.wide-mode .VPContent.has-sidebar {
+    padding-left: 32px !important;
+    padding-right: 32px !important;
+  }
+}
+
+/* ============================================================
+   普通模式下也把正文列放宽一点（默认 688px 偏窄，图会挤）
+   ============================================================ */
+:root {
+  --vp-layout-max-width: 1520px;
+}
+@media (min-width: 1280px) {
+  .VPDoc.has-aside .content-container {
+    max-width: 900px;
+  }
+}
