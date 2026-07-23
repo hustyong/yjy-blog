@@ -2,9 +2,9 @@
    全宽阅读模式（html.wide-mode，由导航栏"全宽"开关切换）
    —— 收起左侧章节目录 + 右侧页内目录，正文铺满可用宽度
    ============================================================ */
-html.wide-mode {
-  --vp-sidebar-width: 0px;
-}
+/* 注意：不要把 --vp-sidebar-width 置 0——导航栏标题是绝对定位、宽度绑定该变量，
+   置 0 会让标题塌缩、与右侧搜索框重叠。侧栏用 display:none 隐藏即可，
+   正文铺满靠下面的 VPContent padding + content-container max-width，二者都不依赖该变量。 */
 html.wide-mode .VPSidebar {
   display: none !important;
 }
