@@ -89,19 +89,22 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-    SP["静态指令 systemPrompt（角色/规则/工具说明）<br/>每轮重建 · 不落盘"] -->|独立参数| Sys["API 顶层 system 字段（cache_control）"]
-    UC["环境上下文 userContext（cwd/git/日期/平台）<br/>每轮前置 · isMeta · 不落盘"] -->|前置一条 reminder| Msg["messages 最前面"]
+    SP["systemPrompt 基座（角色/规则/工具说明 + cwd/platform/OS/会话起始日期）<br/>+ systemContext（git 状态）<br/>提交轮重建 · systemContext 为 memoize · 不落盘"] -->|独立参数| Sys["API 顶层 system 字段（cache_control）"]
+    UC["userContext（CLAUDE.md 记忆 + 当前日期）<br/>每次调用前置 · isMeta · memoize · 不落盘"] -->|前置一条 reminder| Msg["messages 最前面"]
     Conv["对话消息 user / assistant / tool_result"] --> API["一次 API 请求"]
     Sys --> API
     Msg --> API
     Conv --> Store["transcript JSONL：只存对话消息"]
 ```
 
-- **两条通道**：
-  - **`systemPrompt`（静态指令）** → 走 API 的**顶层 `system` 字段**（独立参数，**不是**拼进 messages），并打 `cache_control` 作可缓存的稳定前缀（`buildSystemPromptBlocks`）。
-  - **`userContext`（环境键值）** → `prependUserContext` 在**每次调模型时**即时拼**一条** `<system-reminder>` 放到 messages **最前面**（标 `isMeta`）。是"仅置顶一条"，不是每条消息都带。
-- **会不会变**：一轮之内 `systemPrompt` **算一次、保持稳定**（为 prompt 缓存）；跨轮/每次提交**重新构建**，环境变了（cwd/工具/MCP/日期/git）它就变。真正每轮都变的动态内容（待办、提醒、记忆）**不放系统提示**，而走 `<system-reminder>` 附件（见[《08》](./08-context-assembly.md)），正是为了让 `system` 字段稳定可缓存。
-- **存不存**：**都不存**。`recordTranscript` 只记 `messages`；`systemPrompt` 不入盘，`userContext` 那条因 `isMeta` 也**不进持久化**——每次调用即时生成、用完丢弃，**磁盘 0 份、也不累积**。
+- **两条通道（内容别混：git/cwd/平台在 system 字段，不在前置 reminder）**：
+  - **`systemPrompt` + `systemContext` → 顶层 `system` 字段**：静态指令（角色/规则/工具说明）+ **cwd / platform / OS / 会话起始日期**（`constants/prompts.ts:642-691`）+ **git 状态**（`systemContext`，`context.ts:116`），走 API 的**独立 `system` 字段**（不是拼进 messages），由 `buildSystemPromptBlocks`（`claude.ts:3213`）打 `cache_control` 作可缓存稳定前缀。
+  - **`userContext` → 置顶一条 `<system-reminder>`**：内容是 **CLAUDE.md 记忆 + 当前日期**（`getUserContext`→`{claudeMd, currentDate}`，`context.ts:155-188`），由 `prependUserContext`（`utils/api.ts:449`）在**每次调模型时**拼**一条**放 messages **最前**（`isMeta`）。**仅置顶一条**，不是每条消息都带；**不含 cwd/git**。
+- **会不会变**：
+  - **一个提交轮内**：`systemPrompt`/`systemContext`/`userContext` 逐字节**不可变**（`queryLoop` 只读 param，注释 *"never reassigned during the query loop"*，`query.ts:251-262`），连轮内压缩都不动。
+  - **跨提交轮**：`userContext` 与 `systemContext` 都是 **`memoize`（会话级冻结）**——**不是每次提交跟着环境重读**，**只有 cwd 改 / 压缩**才 `cache.clear()` 刷新（`context.ts:32-33`）；git 状态、日期中途通常不刷（跨午夜也不刷）。**基座 `systemPrompt` 不 memoize、每提交轮现读 `getCwd()`/平台重建**——所以 cwd 改了它确实变；但系统提示按 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 切两半：**静态段（角色/规则/工具用法…，`cacheScope:'global'` → 打 cache_control）在边界前、动态段（cwd/平台/OS/git，`cacheScope:null` → 不打标记）在边界后**（`constants/prompts.ts:573`、`utils/api.ts` `splitSysPromptPrefix`）。故 **cwd 一变只 churn 未缓存的动态尾段、不破前面的静态缓存**——env 是**有意放在边界后**的（详见《08》§4.1）。**换言之：`systemPrompt` 会随 cwd/平台变，但变的部分被结构性地挡在缓存边界之外。**（另注：**tools/MCP 是独立的 `tools` 字段**，它们变破的是 tools 段、不是 system。）
+  - 真正每轮都变的动态内容（待办、提醒、记忆浮现）**不放 system**，走**尾部** `<system-reminder>` 附件（见[《08》](./08-context-assembly.md)§5.1 三条通道），正是为让 `system` 字段稳定可缓存。
+- **存不存**：**都不存**。`recordTranscript` 只记 `messages`；`systemPrompt`/`systemContext` 走 `system` 字段不入盘，`userContext` 那条**因根本不进 `mutableMessages`** 而不持久化（**注意：不是"因为 isMeta"——`isMeta` ≠ 不落盘，尾部附件同样 isMeta 却会落盘，见[《08》](./08-context-assembly.md)§5.1**）。三者都每次即时生成、用完丢弃，**磁盘 0 份、也不累积**。
 - **怎么恢复**：`--resume` **只还原对话消息**；系统提示与环境上下文是用**当前环境就地重建**的，不是从磁盘还原。**后果**：恢复出的对话忠实，但"框架"（系统提示/日期/可用工具）是**当下版本**，可能与原会话不同。
 - **为何这样设计**：持久化的是"对话"这个**不可再生**的东西；系统提示/环境是"环境的**可复现函数**"，重建反而永远最新、且不撑大存储与上下文。
 

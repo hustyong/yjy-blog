@@ -351,25 +351,41 @@ flowchart LR
 - **模型知道该怎么看待它**：系统提示里明确告诉模型——`<system-reminder>` 是**系统自动加的**、含有用信息与提醒，且**与所在的具体工具结果/用户消息无直接关系**。这避免模型把提醒误当成用户的话。
 - **随流注入**：在主循环里，每个工具轮之后就生成这些附件消息并 `yield` 出来、并入工具结果一起回灌（与[《全景与主循环》](./00-overview.md)的流式回传一致）。
 
-### 5.1 两个注入位置：前置 env 上下文 vs 后置附件
+### 5.1 三条通道：system 字段 / 前置 reminder / 后置附件（各装什么、会不会变）
 
-`<system-reminder>` 其实有**两个进消息的位置**，本篇讲的"附件"是**后置**那类，另有一条**前置**通道要一并知道：
+模型这一次请求里的"非对话内容"，其实分**三条不同的路**进去——最容易混的是把 git、cwd 当成"前置 userContext"，其实它们在 **system 字段**里。先钉死映射（**源码为准**）：
 
 ```mermaid
 flowchart LR
-    UC["userContext（cwd/git/日期/平台）"] -->|每次调用即时前置| Front["messages 最前面 1 条 &lt;system-reminder&gt;"]
-    ATT["本轮附件（待办/记忆/提醒…）"] -->|随流注入| Back["并入最近 user 消息（后置）"]
-    Front --> Req["同一次请求"]
+    SP["systemPrompt 基座（静态指令 + cwd/platform/OS/会话起始日期）<br/>+ systemContext（git 状态）"] -->|独立 system 字段·打 cache_control| Sys["顶层 system 参数（不进 messages）"]
+    UC["userContext（CLAUDE.md 记忆 + 当前日期）"] -->|每次调用即时前置 1 条| Front["messages 最前 1 条 &lt;system-reminder&gt;（isMeta）"]
+    ATT["本轮附件（待办/计划/记忆/诊断…）"] -->|随流注入| Back["并入最近 user 消息（后置）"]
+    Sys --> Req["同一次请求"]
+    Front --> Req
     Back --> Req
 ```
 
-- **前置**：环境上下文 `userContext` 由 `prependUserContext` 在**每次调模型时**拼**一条** `<system-reminder>` 放到 messages **最前面**（标 `isMeta`）。
-- **后置**：本篇讲的各类附件，注入到**最近一条 user 消息**（工具结果之后）。
-- **共性与关键差别（易错）**：两者都用 `<system-reminder>` 包装、都标 `isMeta`；但**持久化不同**——
-  - **前置 `userContext` 是真 transient**：`prependUserContext` 即时拼一个新数组给 API，**从不进 `mutableMessages`、不落盘、不累积**。
-  - **后置附件会落盘并累积**：`QueryEngine` 的 `case 'attachment'` 会 `mutableMessages.push` + `recordTranscript`——它们**进入活动上下文、在历史里累积**（靠节流/去重/会话上限/压缩兜住，见 §6.3 记忆的 60KB 会话上限）。
-  - ⚠️ **`isMeta` ≠ "不落盘"**：`isMeta` 只表示"合成消息"（非用户敲入），不代表不持久化。只有前置 `userContext` 因根本不进 messages 才真正不落盘。
-- 与"系统提示"再区分：真正的 `systemPrompt`（角色/规则/工具说明）走 API 的**独立 `system` 字段**，既不是这里的前置也不是后置——三者是三条不同的路。
+| 装什么 | 走哪条通道 | 源码 |
+|---|---|---|
+| 静态指令 + **cwd / platform / OS / 会话起始日期** + **git 状态** | **顶层 `system` 字段**（`buildSystemPromptBlocks` 打 `cache_control`）| `constants/prompts.ts:642-691`（cwd/平台/OS）、`context.ts:116`（`getSystemContext`→git）、`claude.ts:3213`/`:1376`/`:1472` |
+| **CLAUDE.md 记忆 + 当前日期** | **messages[0] 的 `<system-reminder>`**（isMeta、仅 1 条）| `getUserContext`→`{claudeMd, currentDate}`（`context.ts:155-188`）、`prependUserContext`（`utils/api.ts:449`）|
+| 待办 / 计划 / 记忆附件 / 诊断 / 用量… | **messages 尾部** `<system-reminder>` | 本篇 §3/§5 |
+
+- **前置**：`userContext`（**CLAUDE.md + 日期**，**不是** cwd/git）由 `prependUserContext` 在**每次调模型时**拼**一条** `<system-reminder>` 放 messages **最前**（`isMeta`）。
+- **后置**：本篇各类附件，注入到**最近一条 user 消息**（工具结果之后）。
+- **`systemPrompt` 独立成路**：角色/规则/工具说明 + cwd/平台/OS/日期 + git 状态，走 API 的**独立 `system` 字段**（打 cache_control），既不是前置也不是后置——**三条路，别混**。特别地：**git 在 system 字段（`systemContext`），不在前置 reminder**。
+
+**会不会变（易错，与《08》§4.1 呼应）**：
+
+- **一个提交轮内**：三段前缀全部**逐字节不可变**——`systemPrompt`/`systemContext`/`userContext` 在 `queryLoop` 入口解构为只读 param（注释 *"Immutable params — never reassigned during the query loop."*，`query.ts:251-262`），连轮内压缩都不动。
+- **跨提交轮**：`userContext` 与 `systemContext` 都是 **`memoize`（会话级冻结）**——**不是每次提交跟着环境重读**；**只有 cwd 改 / 压缩**才 `cache.clear()` 刷新（`context.ts:32-33`）。所以 git 状态、日期在会话中途通常**不刷**（跨午夜也不刷，除非清缓存）。而基座 `systemPrompt`（**不 memoize**）每个提交轮**现读 cwd/平台重建**，cwd 改了它确实变——但系统提示按 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 分成**静态段（可缓存）+ 动态段（cwd/平台/OS/git，不打 cache_control）**，cwd 变**只 churn 未缓存的动态尾段、不破静态大前缀**（详见《08》§4.1）。**换言之：`systemPrompt` 会随 cwd/平台变，但变的部分被结构性地挡在缓存边界之外。**
+- **真正每轮都变的动态内容**（待办/计划/记忆浮现/诊断）**不进 system**，走**尾部** `<system-reminder>` 附件——正是为让 `system` 字段稳定可缓存（这也是本篇后置通道存在的根本动机）。
+
+**持久化差别（易错）**：三条路里，只有**前置 `userContext` 真 transient**——
+
+- **前置 `userContext`**：`prependUserContext` 即时拼一个新数组给 API，**从不进 `mutableMessages`、不落盘、不累积**。
+- **后置附件会落盘并累积**：`QueryEngine` 的 `case 'attachment'` 会 `mutableMessages.push` + `recordTranscript`——**进活动上下文、在历史里累积**（靠节流/去重/会话上限/压缩兜住，见 §6.3 记忆 60KB 上限）。
+- ⚠️ **`isMeta` ≠ "不落盘"**：`isMeta` 只表示"合成消息"（非用户敲入），不代表不持久化。只有前置 `userContext` 因根本不进 messages 才真正不落盘。
 
 ### 5.2 工具 schema 不走 system-reminder：`<functions>` vs `<system-reminder>`
 
@@ -396,9 +412,9 @@ flowchart LR
 
 | 通道 | 进 `messages`/落盘? | 会累积? | 说明 |
 |------|:---:|:---:|------|
-| `systemPrompt` | ❌ | ❌ | 走 API 独立 `system` 字段，每次一份、重建 |
+| `systemPrompt`（+ `systemContext`：git 状态）| ❌ | ❌ | 走 API 独立 `system` 字段；基座每提交轮重建，`systemContext` 为 memoize（会话冻结）|
 | `tools` schema | ❌ | ❌ | 走 API 独立 `tools` 参数（→`<functions>`）|
-| **前置 `userContext`** | ❌ | ❌ | `prependUserContext` 即时拼、**从不进 `mutableMessages`** |
+| **前置 `userContext`**（CLAUDE.md + 日期）| ❌ | ❌ | `prependUserContext` 即时拼、**从不进 `mutableMessages`**；内容为 memoize（会话冻结，cwd 改/压缩才刷）|
 | **后置各类附件**（待办/计划/记忆/IDE/诊断…）| ✅ | ✅**（受控）** | `QueryEngine` `case 'attachment'` → `recordTranscript`，**进活动上下文并累积** |
 
 > 纠正一个曾经的误解：**`isMeta` ≠ 不落盘**。`isMeta` 只表示"合成消息"，附件仍会落盘。真正 transient 的只有**前置 `userContext`**。
