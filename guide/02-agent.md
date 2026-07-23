@@ -251,6 +251,81 @@ sequenceDiagram
 
 ---
 
+### 4.2 子 Agent 要不要问人授权：同步/异步分档 + 「队列叫号」式解耦
+
+§4 说了子 Agent 可同步、可异步。那**它们干活时要用危险工具（改文件、跑命令），该找谁授权？会不会把主对话卡住？** 这节讲清——先给三句话结论：
+
+1. **派生子 Agent 这个动作本身不问人**；真正的关卡在**子 Agent 内部的每一次工具调用**上。
+2. 问人**不是"回到主 Agent 那里干等"**，而是往一个**全局队列**塞一张"待批条"——谁塞的无所谓；**你在终端一选，那张条对应的那次调用就当场继续**。UI 显示和 agent 循环彻底解耦。
+3. **能不能弹窗问你，取决于它是同步还是异步**：同步子 Agent 能问，异步后台 Agent 默认不问（自动拒，除非 hook 放行或显式开 `bubble`）。
+
+#### ① 门开在哪：派生是"自动放行"，内部工具才是关卡
+
+`Agent` 工具自己几乎不拦：`isReadOnly()` 直接返回 `true`，源码注释写得很直白——*"delegates permission checks to its underlying tools"*（把权限检查**委托给它内部调用的工具**，`AgentTool.tsx:1264-1265`）；`checkPermissions` 除 `auto` 模式会走分类器 `passthrough` 外，一律返回 `allow`（`AgentTool.tsx:1281-1297`）。所以"起一个子 Agent"本身基本不需要你点头，**危险操作的授权发生在子 Agent 跑起来之后、它每次要用 Bash/Edit 等工具的那一刻**。
+
+#### ② 一个通俗类比：银行的"取号排队"
+
+把整套授权想成银行大厅：
+
+- 任何 agent（主的、子的）想办一笔**危险业务**（跑 bash、写文件）= 一位顾客要办业务；
+- `canUseTool` = **取号机**；全场所有 agent 共用**同一台取号机、同一块叫号大屏**（就是 REPL 里那个 `toolUseConfirmQueue` 队列）；
+- 顾客取号后**坐下等叫号**（这次工具调用 `await` 一个 Promise），**不占柜台、不霸大厅**——别的并发只读工具照样办；
+- **你（人）= 唯一的柜员**，盯着大屏一号一号处理；你在终端点"允许/拒绝"，就等于"办完这一号"，对应那位顾客（那次工具调用）**当场被叫醒、继续往下走**；
+- 号和顾客是用**回调**绑定的，所以柜员根本不用管"这号是主 Agent 取的还是某个子 Agent 取的"——**办完直接叫醒本人**。
+
+#### ③ 机制：父子共用同一个 `canUseTool` + 队列 + Promise
+
+```mermaid
+sequenceDiagram
+    participant Sub as 子 Agent（某次工具调用）
+    participant CUT as canUseTool（父子共用）
+    participant Q as REPL 队列 + 叫号大屏
+    participant U as 你（终端）
+
+    Sub->>CUT: 我要跑 `bash xxx`，给授权
+    CUT->>CUT: 先按规则判（hasPermissionsToUseTool）
+    alt 规则已能定（allow / deny）
+        CUT-->>Sub: 直接 resolve，无需打扰你
+    else 需要问人（ask）
+        CUT->>Q: pushToQueue 一张待批条<br/>（带 onAllow / onReject / onAbort 回调）
+        Note over Sub: 工具调用 await 一个 Promise<br/>坐等，不占柜台
+        Note over Q: 同时后台跑 hooks/classifier<br/>与"你点击"竞速
+        U->>Q: 终端里选「允许」
+        Q->>CUT: 触发 onAllow → resolveOnce（只结算一次）
+        CUT-->>Sub: Promise 兑现，这次调用继续
+    end
+```
+
+对着源码逐环节坐实：
+
+- **只有一个取号机，且父子共用**：主线程建了**唯一**的 `canUseTool` 闭包，绑定到 REPL 的队列 `setToolUseConfirmQueue`（`screens/REPL.tsx:2382`；队列 state `toolUseConfirmQueue` 在 `REPL.tsx:1101`）。子 Agent **不另造**：`AgentTool.call*(…, canUseTool, …)`（`AgentTool.tsx:250`）接收父层传入的这个闭包，原样丢给 `runAgent(… canUseTool …)`（`AgentTool.tsx:607`）→ **父子共用同一个队列、同一个终端 UI**。
+- **取号后坐等 = await 一个 Promise**：`useCanUseTool` 里整个决策就是 `new Promise(resolve => …)`（`hooks/useCanUseTool.tsx:32`）。先 `hasPermissionsToUseTool` 按规则判（`:37`）——`allow` 就直接 `resolve` 放行、`deny` 直接回绝；只有落到 **`ask`** 才进入 `handleInteractivePermission`（`:160`）去"排队问人"。
+- **排队问人 = 塞队列 + 竞速 + 只结算一次**：`handleInteractivePermission` 把一张 `ToolUseConfirm`（带 `onAllow/onReject/onAbort` 等回调）**推入队列**（`ctx.pushToQueue`），**同时**在后台跑 hooks/分类器，让它们和"你的点击"**竞速**；用 `createResolveOnce` 保证无论谁先出结果，那个被 park 的 Promise **只兑现一次**（`hooks/toolPermission/handlers/interactiveHandler.ts:70,92,154-202`；`PermissionContext.ts:75-83`）。
+- **所以主循环没在"自旋等你"**：它只是有**一次工具调用**停在 Promise 上；同一批里的并发安全（只读）兄弟工具照跑，并发上限默认 10（`CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`，`services/tools/toolOrchestration.ts:10`）。这正是你体感上"授权没卡住整个主 Agent"的原因。
+
+#### ④ 同步 / 异步 / bubble 三档（决定"能不能弹窗问你"）
+
+关键开关是 `canShowPermissionPrompts`，**默认 `!isAsync`**（同步能问、异步不能问；`runAgent.ts:276, 439-445`）：
+
+| 子 Agent 类型 | 能弹窗问你? | 遇到 `ask`（规则/hook/分类器都定不了）时 |
+|---|---|---|
+| **同步子 Agent**（默认）| ✅ 能 | 冒泡到父终端的共享队列，正常弹窗等你选（`runAgent.ts:439-445`）|
+| **异步/后台 Agent**（`run_in_background` / 定义 `background`）| ❌ 不能 → 置 `shouldAvoidPermissionPrompts=true`（`runAgent.ts:446-451`）| 先给 PermissionRequest hooks 一次决策机会；**hook 不决则自动 deny**（`permissions.ts:932-951`，理由标 `asyncAgent`，因为它没有 UI 可弹）|
+| **`bubble` 模式 / 显式开 `canShowPermissionPrompts`** | ✅ 能 | 也弹窗，但额外置 `awaitAutomatedChecksBeforeDialog=true`（`runAgent.ts:443-444, 458-462`）——**只有自动检查都决不了才打扰你**，尽量少中断后台活儿 |
+
+一句话记：**同步子 Agent"随时能敲你的门"；异步后台 Agent"默认自己扛（自动拒），除非 hook 替它放行或显式让它 bubble"。**
+
+#### ⑤ 回到最初的三个疑问（逐条对账）
+
+- **"human 会出现在任何派生子 Agent 返回时吗？"** → 更准确的说法是**"执行途中"而非"返回时"**：只要某个**有资格弹窗**的 agent（同步子 Agent / bubble / 主 Agent）在**某次工具调用**上撞到规则+hook+分类器都无法自动裁决的 `ask`，就会在共享队列里冒出来问你——**可能发生在子 Agent 跑到一半时**。异步后台 Agent 则不打扰你（自动拒或交给 hook）。
+- **"应该不是在主 Agent 那里阻塞等人授权"** → **对**。授权是 Promise + 队列，主循环不自旋；并发安全的兄弟工具照跑。
+- **"授权在终端选完传回去就行，不必过主 Agent，显示跟循环分开的"** → **对**。子 Agent 用的就是那个共用 `canUseTool`；终端选择触发 `onAllow/onReject` → `resolveOnce` **直接唤醒那次调用**，不绕经主 Agent 的对话逻辑；渲染（React 队列）与 agent 循环（await）解耦。
+- **plan 模式为何看到 Explore、Plan agent"依次"跑** → 那是**模型自己排的序**（Plan 需要用 Explore 的探索结果），**不是系统只能串行**。系统本身支持并行（`AgentTool.isConcurrencySafe()=true`，`AgentTool.tsx:1273`；见 §1、§3）——同一轮吐出多个子 Agent 调用会真并发。
+
+> 一句话收束：**授权像"共用一台取号机 + 一块叫号大屏"——任何 agent 要办危险业务就取号坐等（await Promise），你在终端叫号（选允许/拒绝）就唤醒对应那位；能不能敲你的门由"同步/异步"决定。所以既有多 Agent 并行，人的介入又不会把主循环钉死。**
+
+---
+
 ## 5. Agent 间通信与记忆
 
 **通信（SendMessage）**（`tools/SendMessageTool/`）：一个 Agent 可向另一个 Agent/队友发消息——目标可以是**具名队友**、**广播**、或跨会话通道。消息写入对方**邮箱**，在其下一轮作为输入注入。除普通文本外还支持**结构化消息**（如关机请求/响应、计划审批响应），用于团队编排里的控制流。
@@ -328,6 +403,7 @@ flowchart LR
 - 后台任务：`tasks/`（真实类型联合 `tasks/types.ts` 的 `TaskState`：LocalAgentTask/RemoteAgentTask/InProcessTeammateTask/LocalMainSessionTask/LocalShellTask/LocalWorkflowTask/MonitorMcpTask/DreamTask）；通用底座 `Task.ts`（`TaskStateBase`/`createTaskStateBase`）
 - 后台任务的启动/进度/回传：`tasks/LocalAgentTask/LocalAgentTask.tsx`（`registerAsyncAgent`/`runAsyncAgentLifecycle`/`updateProgressFromMessage`/`enqueueAgentNotification`）、`tasks/LocalShellTask/LocalShellTask.tsx`（`enqueueShellNotification`/`markTaskNotified`）；队列 `utils/messageQueueManager.ts`（`enqueuePendingNotification`，`mode:'task-notification'`）；XML 标签 `constants/xml.ts`（`TASK_NOTIFICATION_TAG`/`OUTPUT_FILE_TAG`/`STATUS_TAG`/`SUMMARY_TAG`…）；主循环 drain `query.ts`
 - 通信 / 记忆：`tools/SendMessageTool/`、`services/AgentSummary/`
+- 子 Agent 授权链路（§4.2）：`hooks/useCanUseTool.tsx`（唯一 `canUseTool`，绑定队列）、`screens/REPL.tsx`（`useCanUseTool(...)` 调用点 `:2382`、队列 state `toolUseConfirmQueue` `:1101`）、`AgentTool.tsx`（`call*` 收 `canUseTool` `:250`、传入 `runAgent` `:607`、`isReadOnly/checkPermissions` `:1264-1297`）、`tools/AgentTool/runAgent.ts`（`canShowPermissionPrompts` 默认 `!isAsync`、`shouldAvoidPermissionPrompts`/`awaitAutomatedChecksBeforeDialog` `:276,439-462`）、`utils/permissions/permissions.ts`（异步 agent `ask` → hooks 否则自动 deny `:932-951`）、`hooks/toolPermission/handlers/interactiveHandler.ts`（`pushToQueue` + 回调 + 竞速）、`hooks/toolPermission/PermissionContext.ts`（`createResolveOnce`/队列 ops）、并发上限 `services/tools/toolOrchestration.ts`（`getMaxToolUseConcurrency` `:10`、`runToolsConcurrently` `:152-176`）
 - 团队/队友：`tools/TeamCreateTool/`、`utils/teammateMailbox.ts`、共享任务清单 `utils/tasks.ts`（`getTaskListId`，`~/.claude/tasks/<队伍名>/`）、协调者模式 `coordinator/`（`COORDINATOR_MODE`）
 - worktree 隔离：`utils/worktree.ts`（`worktreePathFor`/`worktreeBranchName`/`getOrCreateWorktree`/`createAgentWorktree`）、`tools/AgentTool/AgentTool.tsx`（slug=`agent-<id8>`）、`utils/git.ts`（`resolveCanonicalRoot`：`.git` 文件 → `gitdir:` → `commondir` 链 + 安全校验）
 

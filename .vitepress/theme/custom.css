@@ -8,7 +8,11 @@
 html.wide-mode .VPSidebar {
   display: none !important;
 }
-html.wide-mode .VPDocAside {
+/* 关键：不仅要隐藏 aside 里的目录组件（.VPDocAside），
+   更要隐藏它外层那根弹性列 .aside（max-width:256px + padding-left:32px），
+   否则这根空列仍占在 flex 行里，正文右侧留一块吃不掉的空白。 */
+html.wide-mode .VPDocAside,
+html.wide-mode .VPDoc .aside {
   display: none !important;
 }
 html.wide-mode .VPDoc.has-aside .content-container {
