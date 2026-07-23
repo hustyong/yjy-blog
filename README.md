@@ -1,35 +1,72 @@
 # yjy-blog
 
-这是一个最小可部署的 Cloudflare Pages 项目，用来把短路径 `/redis` 跳转到一条很长的微信公众号文章专辑链接。
+Cloudflare Pages 项目，一个仓库两用：
 
-## 项目结构
+- **`/`** → VitePress 博客《Claude Code 核心机制剖析》（12 篇 + 首页）
+- **`/redis`** → 302 跳转到微信公众号 Redis 文章专辑（`functions/redis.js`）
 
-- `public/index.html`：静态首页，用作兜底展示
-- `functions/index.js`：访问根路径 `/` 时，自动跳转到 `/redis`
-- `functions/redis.js`：访问 `/redis` 时，返回 `302` 跳转到目标微信链接
+## 路由原理
 
-## 部署到 Cloudflare Pages
+Cloudflare Pages **Functions 优先于静态资源**：
 
-1. 把当前仓库推到 GitHub、GitLab 或 Cloudflare 可连接的代码仓库。
-2. 在 Cloudflare 后台创建一个新的 Pages 项目，并绑定这个仓库。
-3. 构建命令留空。
-4. Build output directory 设置为 `public`。
-5. 完成部署后，访问 `https://你的项目.pages.dev/` 或 `https://你的项目.pages.dev/redis`。
+- 访问 `/redis`：先命中 `functions/redis.js`，服务端 302 跳公众号（不经过博客）。
+- 访问 `/`、`/guide/*`：无对应函数 → 由 VitePress 构建产物（静态）提供。
 
-## 本地预览
+以后要加更多公众号短链，只需在 `functions/` 下新增 `<名字>.js`（照抄 `redis.js`，换 `target`），即得 `/<名字>` 跳转。
 
-如果本机已经安装 `wrangler`，可以在项目根目录执行：
+## 目录
 
-```bash
-wrangler pages dev public
+```
+yjy-blog/
+├── functions/
+│   └── redis.js          # /redis → 公众号（保留）
+├── .vitepress/
+│   ├── config.mts        # 侧边栏/主题/Mermaid/中文/搜索/srcExclude
+│   ├── linkify.py        # 交叉引用转链接 + 编号平移
+│   └── escape_angles.py  # 散文裸 < 转义
+├── guide/                # 12 篇（由 sync.sh 从 analysis 生成，勿手改）
+├── index.md              # 博客首页
+├── sync.sh               # 从内容源重生 guide/
+└── package.json
 ```
 
-启动后访问 `http://127.0.0.1:8788/redis` 即可测试跳转。
+## 本地开发
 
-## 说明
+```bash
+npm install
+npm run docs:dev       # 博客预览 http://localhost:5173
+npm run docs:build     # 构建到 .vitepress/dist
+```
 
-- 这只是一个“中转跳转”，不是把微信链接真正替换成你的域名，最终打开的仍然是 `mp.weixin.qq.com`。
-- 目标链接里包含 `sessionid`、`pass_ticket` 这类参数，后续可能失效。
-- 这个链接对应的是微信公众号“文章专辑/合集”类型，不是图片相册。
-- 如果要长期使用，建议换成更稳定的原始微信链接。
-- 正式使用时，通常自定义域名会比 `*.pages.dev` 更稳。
+同时联测博客 + `/redis` 跳转（需 wrangler）：
+
+```bash
+npm run docs:build
+npx wrangler pages dev .vitepress/dist   # 会自动挂载 functions/
+# 访问 http://localhost:8788/ 看博客，/redis 测跳转
+```
+
+## 内容更新
+
+正文只在内容源仓库 `claude-code-learn/analysis/` 改，然后：
+
+```bash
+bash sync.sh           # 从 analysis 重新拷贝 + 平移编号 + 转义（勿手改 guide/）
+npm run docs:build
+```
+
+> `sync.sh` 默认从 `/Users/jieyongyang/work/claude-code-learn/analysis` 取源，可用 `ANALYSIS_SRC=... bash sync.sh` 覆盖。
+
+## Cloudflare Pages 设置（从纯跳转站迁到博客时改这几项）
+
+| 设置项 | 旧值 | 新值 |
+|--------|------|------|
+| Build command | 留空 | `npm run docs:build` |
+| Build output directory | `public` | `.vitepress/dist` |
+| 环境变量 | — | `NODE_VERSION = 20` |
+
+`functions/` 在仓库根，Cloudflare 自动识别，不受 output 目录变化影响。改完设置并 push 到主分支即自动重建。
+
+## 说明（原跳转仓库遗留）
+
+- `/redis` 只是"中转跳转"，最终打开的仍是 `mp.weixin.qq.com`；目标链接含 `sessionid`/`pass_ticket` 等参数，后续可能失效，建议换更稳定的原始微信链接。

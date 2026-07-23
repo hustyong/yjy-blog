@@ -1,0 +1,17 @@
+{
+  "name": "claude-code-analysis-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Claude Code 核心机制剖析 · 静态博客（VitePress）",
+  "type": "module",
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "mermaid": "^11.4.0",
+    "vitepress": "^1.5.0",
+    "vitepress-plugin-mermaid": "^2.0.17"
+  }
+}
