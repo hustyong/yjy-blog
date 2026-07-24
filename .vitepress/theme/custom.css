@@ -44,23 +44,9 @@ html.wide-mode .VPDoc.has-aside .content-container {
   }
 }
 /* ============================================================
-   Mermaid 图：修"中文字撑破节点框被裁"
-   —— 根因：mermaid 测宽的临时元素在 body 下用默认字号，
-      真正渲染的 label 在 .vp-doc 里字号更大 → 文字比测得宽 → 被 foreignObject 裁掉。
+   Mermaid 图：只做"宽图可横向滚动 + SVG 自适应宽度"。
+   —— 不改标签内部排版（字号/行高/nowrap），否则渲染尺寸与 mermaid 自身
+      测量不一致，会导致节点框过大、文字挤顶、上下节点重叠。
    ============================================================ */
-.mermaid { overflow-x: auto; }              /* 宽图可横向滚动，不硬裁 */
+.mermaid { overflow-x: auto; }
 .mermaid svg { max-width: 100%; height: auto; }
-/* 关键：让节点标签允许溢出可见，即使测宽略小也不裁字 */
-.mermaid foreignObject { overflow: visible; }
-/* 统一 label 字号/行高，减少与 mermaid 测宽的偏差（覆盖 .vp-doc 的 p 样式） */
-.mermaid .nodeLabel,
-.mermaid .edgeLabel,
-.mermaid .cluster-label,
-.mermaid foreignObject div,
-.mermaid foreignObject span,
-.mermaid foreignObject p {
-  font-size: 14px !important;
-  line-height: 1.35 !important;
-  margin: 0 !important;
-  white-space: nowrap;
-}
