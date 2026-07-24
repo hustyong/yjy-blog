@@ -50,7 +50,3 @@ html.wide-mode .VPDoc.has-aside .content-container {
    ============================================================ */
 .mermaid { overflow-x: auto; }
 .mermaid svg { max-width: 100%; height: auto; }
-/* 露出被框底裁掉的行：foreignObject 溢出可见 + 去掉 .vp-doc 给标签 <p> 的段落边距（那 16px 会把标签撑高出框） */
-.mermaid foreignObject { overflow: visible; }
-.mermaid .nodeLabel p,
-.mermaid foreignObject p { margin: 0 !important; }
