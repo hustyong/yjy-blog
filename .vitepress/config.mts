@@ -56,5 +56,10 @@ export default withMermaid({
     },
   },
 
-  mermaid: {},
+  // Mermaid：定死字体与 htmlLabels，避免"测宽用回退字体、渲染用 .vp-doc 字体"导致中文撑破节点框被裁
+  mermaid: {
+    fontFamily:
+      '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif',
+    flowchart: { htmlLabels: true, useMaxWidth: true },
+  },
 })

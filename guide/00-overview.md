@@ -152,6 +152,102 @@ stateDiagram-v2
 
 ---
 
+### 3.1 外部输入怎么回到主循环：统一命令队列 + 提交轮/工具轮时序
+
+主循环跑着时，有两种"外部东西"想插进来：**你中途敲的字**、和**后台任务跑完的结果**。它们**不直接打断模型**，而是先进**同一个进程级命令队列**，再在合适时机被"drain（取出）"注入。先分清两个"轮"（与《08》§4 同口径）：
+
+- **提交轮**：一次 `query()`（你敲回车起一轮）；内部是 `while(true)`。
+- **工具轮**：`while` 每迭代一次 = 一次模型 API 请求（源码的 `turn`）。**一个提交轮 = 1..N 个工具轮**。
+
+**统一队列 + 三档优先级**（`utils/messageQueueManager.ts`，`now(0) → next(1) → later(2)`，数字越小越优先）：
+
+| 进队的东西 | mode | 优先级 | 语义 / 入队者 |
+|---|---|:---:|---|
+| **外部/SDK 插队消息** | `prompt` | `now`(0) | **打断并立即发**（≈ Esc+send）；由外部 chat 客户端（经 UDS）/SDK 显式 `priority:'now'`（`types/textInputTypes.ts:276-291`）——**终端敲字不会产生 now**，见 §3.2 |
+| **用户输入** | `prompt` | `next`(1) | 终端敲字，`enqueue` 默认 `next`（`:128`）|
+| **后台任务完成通知** | `task-notification` | `later`(2) | `enqueuePendingNotification`（`:142`，注释 *"so user input is never starved"*）|
+
+**两个"闸口"决定它何时、进哪个轮：**
+
+```mermaid
+flowchart TB
+    subgraph Q["统一命令队列（进程级单例）· 优先级 now → next → later"]
+      U["用户输入 · next"]
+      T["后台完成通知 · later"]
+    end
+    Q -->|"闸口A：提交轮内（工具轮之间）"| A["drain 阈值 = next<br/>模型调了 Sleep 才放宽到 later"]
+    Q -->|"闸口B：空闲时"| B["useQueueProcessor：无活跃 query + 队列非空<br/>按 mode 分批、取最高优先级"]
+    A --> A2["注入当前提交轮的下一个工具轮<br/>（转成 attachment，跟工具结果一起发给模型）"]
+    B --> B2["自动起一个新提交轮承载它（不需你再敲字）"]
+```
+
+- **闸口 A（提交轮内，工具轮之间）**：`query.ts:1570` `getCommandsByMaxPriority(sleepRan ? 'later' : 'next')`。默认阈值 `next` → **捞用户输入、跳过后台通知**；只有本轮模型调了 `Sleep`（`sleepRan`）才放宽到 `later`、把后台通知也捞进来。捞到的转成 attachment 塞进 `toolResults` → 下一个工具轮（`:1580-1631`）。**注意**：这个闸口只在"本轮用了工具、会继续"时才到得了——模型若这轮无工具、要收尾，会更早 `return 'completed'`（`:1357`），到不了闸口 A。
+- **闸口 B（空闲时）**：`useQueueProcessor`（`hooks/useQueueProcessor.ts`）监听"**无活跃 query + 队列非空**"→ `processQueueIfReady`：`peek` 取最高优先级那条、`dequeueAllMatching` 只批量取**同 mode** 的 → **自动起一个新提交轮**（`utils/queueProcessor.ts`）。
+
+**于是两种外部输入的落点（易记版）：**
+
+| 事件 | 模型此刻在… | 落到哪个轮 |
+|---|---|---|
+| **你中途敲字**（`next`）| 还在调工具（会有下个工具轮）| **同一提交轮**的下个工具轮（闸口 A 捞到，跟工具结果一起发）|
+| 你中途敲字 | 已给最终答复、正收尾（无工具）| **下一个提交轮**（本轮已 `return`，输入留队列 → 闸口 B）|
+| 你中途敲字 | **只有 `Sleep` 这类空等工具在跑** | **照常入队 + 顺带 `abort('interrupt')` 提前结束空等**（`handlePromptSubmit.ts:321,336`）→ 输入在新轮处理（详见下方 ⓘ）|
+| **后台任务完成**（`later`）| 主循环在跑且**调了 `Sleep`** | 被 Sleep 那轮捞进**同一提交轮**（闸口 A 放宽）|
+| 后台任务完成 | 主循环在跑但**没 Sleep** | 不打断，**留队列**，空闲后由闸口 B 起**新提交轮**送达 |
+| 后台任务完成 | 主循环已空闲 | 闸口 B 立即起**新提交轮**送达 |
+
+**ⓘ 为什么"敲字打断 Sleep"是特例——工具的 `interruptBehavior`**：你敲字**任何时候都会入队**（`enqueue` `:336` 总执行）；"打断"只是额外动作，取决于当前在跑工具的可中断性（`StreamingToolExecutor.ts:234-236`，默认 `block`）：
+
+| 在跑的工具 | `interruptBehavior` | 你敲字 → | 为什么 |
+|---|:---:|---|---|
+| Bash / Edit / Read…（真干活）| `block`（默认）| **只入队**，等工具轮边界（不打断）| 打断会**浪费在跑的工作** |
+| `Sleep`（空等计时器）| `cancel` | 入队 **+ `abort('interrupt')` 结束空等** → 新轮处理 | 空等**没东西可丢**，取消零成本，立刻响应你 |
+
+- 触发 abort 的条件是"**所有**在跑工具都为 `cancel`"（即此刻只有 Sleep），abort 后 `StreamingToolExecutor.ts:219-228` **只取消 `cancel` 工具**、不动 `block` 工具。
+- 这也对上 `types/textInputTypes.ts:276` 里 "typing wakes an in-progress SleepTool"——**"唤醒 Sleep"就是这个 abort**：把它从空等提前叫醒，而非继续睡。**并非另一套队列路径**，只是"唯一在跑的是可零成本取消的空等"时，系统顺手结束它。
+
+**两条关键结论：**
+
+- **提交轮从不为后台任务空等**：派生后台即 `async_launched` 返回（见[《02》](./02-agent.md)§4），提交轮自管自结束；后台结果默认经**空闲闸口 B 另起一轮**回来（除非模型主动 `Sleep` 等它）。这也是"后台"与**同步子 Agent**（主 Agent await 到它跑完、结果在同一工具轮返回）的分水岭（见[《02》](./02-agent.md)§4.2）。
+- **用户输入优先级高于后台通知**（`next ＞ later`）：你敲的字既能被**闸口 A** 当轮捞上（模型还在动手时），也永远排在后台通知前——"never starved"。
+
+> 一句话：**两种外部输入都走同一个带优先级的队列；用户输入（`next`）能在提交轮内被捞进下个工具轮，后台通知（`later`）默认得等空闲另起一轮——除非模型调 `Sleep` 主动把它拉进当轮。**
+
+### 3.2 打断正在跑的轮：Esc 键 vs `now` 优先级（两条独立路径）
+
+上面 §3.1 的 `next`/`later` 是"**不打断**、排队等注入"。但有两种要**立即打断当前工具轮**的入口——它们**代码路径不同、abort 原因也不同**，别混：
+
+```mermaid
+flowchart TB
+    Esc["① 终端按 Esc"] -->|键盘绑定 chat:cancel| UC["useCancelRequest.handleCancel<br/>Priority1：有活跃任务先中止"]
+    UC -->|onCancel| AB1["abort('user-cancel')"]
+    Now["② 外部/SDK 入队 priority:'now'<br/>（chat 客户端经 UDS）"] -->|队列变化| EF["REPL.tsx:4100 useEffect<br/>见到 now 命令"]
+    EF --> AB2["abort('interrupt')"]
+    AB1 --> Sig["共享 AbortController 信号 → 立即中止在飞的工具/流"]
+    AB2 --> Sig
+    AB2 -.->|中断后| Proc["该 now 消息按最高优先级<br/>由 useQueueProcessor 起新轮处理"]
+```
+
+**① Esc —— 纯键盘中止原语**（`hooks/useCancelRequest.ts`）：
+- 绑定 `chat:cancel` → `handleCancel`。**第一优先级就是中止活跃任务**（`:97-102`，注释 *"so users can always interrupt Claude"*）：`if (abortSignal && !aborted) → onCancel()` → `abort('user-cancel')`（`REPL.tsx:2153`）。
+- 信号打在**共享 AbortController** 上，**立即传播**到在飞的工具（Bash 杀子进程、流式请求 abort…），本轮随即结束、插 `[Request interrupted by user]`（`REPL.tsx:2123`）。
+- **只中止、不带新消息**。几个边界：空输入且处于 bash/后台模式 → Esc 先**退出该模式**（`:134`）；Vim INSERT → 回 NORMAL（`useVimInput.ts:192`）；**主循环空闲且队列有命令** → Esc 变成"**弹掉一条排队命令**"（`popCommandFromQueue`，`:104-110`）。
+
+**② `now` —— 队列里的"打断+插队"消息**（不经 Esc）：
+- 由**外部 chat 客户端（经 UDS）或 SDK** 显式 `enqueue({priority:'now'})`（终端敲键盘不会产生 now）。
+- **专门的队列监听 effect** 处理（`REPL.tsx:4098-4104`）：`if (queuedCommands.some(c => c.priority==='now')) abort('interrupt')`。非交互 `print` 模式对应 `cli/print.ts:1860`。
+- abort 后当前轮结束 → 空闲的 `useQueueProcessor` 按**最高优先级**取出这条 `now` → **起新提交轮处理它**。所以效果 = **中止 + 随后处理这条新消息**。
+
+**两条路径对照：**
+
+| | 触发者 | 代码路径 | abort reason | 带不带新消息 |
+|---|---|---|:---:|---|
+| **Esc** | 终端键盘 | `useCancelRequest`（`chat:cancel`）| `'user-cancel'` | 不带（纯中止）|
+| **`now`** | 外部客户端 / SDK 入队 | `REPL.tsx:4100` 队列监听 effect | `'interrupt'` | 带（那条 now 消息随后被处理）|
+
+> `types/textInputTypes.ts:276` 注释把 `now` 描述为 *"equivalent to Esc + send"*——那是**语义类比**（用户看到的效果像"按 Esc 再发消息"），但**代码路径不同**：一个是键盘 keybinding、一个是队列监听 effect；连 abort reason 都不同（`user-cancel` vs `interrupt`，后者影响中断后的 auto-restore，`REPL.tsx:2996-3002`）。
+
+---
+
 ## 4. 贯穿全栈的流式范式
 
 从模型响应到工具进度，再到最终交给入口层，**全程是 `AsyncGenerator`**——一层套一层地 `yield`，而非"算完再返回"。
@@ -237,7 +333,9 @@ flowchart TB
 ## 附录 · 涉及模块
 
 - 会话引擎：`QueryEngine.ts`（`submitMessage`、`ask` 便捷封装）
-- 主循环状态机：`query.ts`（`query` / `queryLoop`、`State`、Continue/Terminal）
+- 主循环状态机：`query.ts`（`query` / `queryLoop`、`State`、Continue/Terminal；§3.1 提交轮内 drain `getCommandsByMaxPriority(sleepRan?'later':'next')` `:1570`、无工具收尾 `return 'completed'` `:1357`）
+- 统一命令队列（§3.1）：`utils/messageQueueManager.ts`（`enqueue` 用户输入默认 `next` `:128`、`enqueuePendingNotification` 任务通知默认 `later` `:142`、`PRIORITY_ORDER` `:151`、`getCommandsByMaxPriority` `:525`、`dequeue`/`dequeueAllMatching`）、`utils/queueProcessor.ts`（`processQueueIfReady`：peek 最高优先级 + 按 mode 批量 drain）、`hooks/useQueueProcessor.ts`（空闲 + 队列非空 → 自动起新提交轮）、`utils/handlePromptSubmit.ts`（中途敲字 `enqueue({mode:'prompt'})` `:336`、可中断工具 `abort('interrupt')` `:321`）
+- 打断路径（§3.2）：`hooks/useCancelRequest.ts`（Esc→`chat:cancel`→`handleCancel`：Priority1 中止活跃任务 `:97-102`、空闲则弹队列 `:104-110`）、`screens/REPL.tsx`（Esc 落 `abort('user-cancel')` `:2153`、`now` 队列监听 effect→`abort('interrupt')` `:4098-4104`、中断标记 `:2123`）、`cli/print.ts`（print 模式 `getCommandsByMaxPriority('now')` abort `:1860`）、`types/textInputTypes.ts`（`QueuePriority` 三档语义注释 `:276-291`）
 - Token 预算：`query/tokenBudget.ts`
 - 消息类型与构造：`types/message.ts`、`utils/messages.ts`
 - 输入预处理：`utils/processUserInput/`
