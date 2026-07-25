@@ -19,6 +19,7 @@ declare -a MAP=(
   "06-Hooks-System.md:07-hooks.md"
   "07-Context-Assembly.md:08-context-assembly.md"
   "08-Bootstrap-and-Performance.md:09-bootstrap-performance.md"
+  "Prompt-Cache.md:prompt-cache.md"
   "09-Permission-Rule-System.md:10-permission-rules.md"
   "10-Bash-Command-Security.md:11-bash-security.md"
 )

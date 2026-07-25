@@ -35,6 +35,8 @@ M = {
     "《Hooks 扩展系统》": "[《Hooks 扩展系统》](./07-hooks.md)",
     "《上下文装配》": "[《上下文装配》](./08-context-assembly.md)",
     "《权限规则系统》": "[《权限规则系统》](./10-permission-rules.md)",
+    "《08 启动与性能》": "[《09 启动与性能》](./09-bootstrap-performance.md)",
+    "《Prompt 缓存机制》": "[《Prompt 缓存机制》](./prompt-cache.md)",
 }
 
 REF = re.compile(r"《[^》]*》")

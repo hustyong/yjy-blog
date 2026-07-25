@@ -1,6 +1,6 @@
 # 会话管理与压缩（Session & Compaction）
 
-> 讲清会话如何持久化与恢复，以及**三级压缩**（MicroCompact / AutoCompact / Snip）如何在"上下文不撑爆"与"不丢关键信息、不毁 prompt 缓存"之间取得平衡。
+> 讲清会话如何持久化与恢复，以及**三级压缩**（MicroCompact / AutoCompact / Snip）如何在"上下文不撑爆"与"不丢关键信息、不毁 prompt 缓存"之间取得平衡。（"为何压缩要护 prompt 缓存"的机制见[《Prompt 缓存机制》](./prompt-cache.md)。）
 >
 > **原则：源码为准。** 机制均从 `claude-code-cli` 求证；无法确证者标注「推断」。文末附涉及模块。
 

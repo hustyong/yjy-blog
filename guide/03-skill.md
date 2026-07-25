@@ -134,7 +134,7 @@ flowchart TB
 | **① 怎么调** | `SkillTool`（API `tools` 参数 → `<functions>`） | "能调 skill" + 调用协议（`skill:"name", args:…`） | ✅ 随 schema | **永在** |
 | **② 有哪些** | `skill_listing`（`<system-reminder>` 附件） | 全部 skill 的**名字 + 描述** | ❌ 首次 + 增量 | **不重列（会丢）** |
 
-**关键事实**：`SkillTool` 的描述里明写 *"Available skills are listed in system-reminder messages"*，且入参 `skill` 是 `z.string()`（**非 enum**）。所以**工具 schema 本身不枚举名单**——"怎么调"永在,"有哪些"全靠通道②那条 reminder。下面把两条通道**真实的字**贴出来。
+**关键事实**：`SkillTool` 的描述里明写 *"Available skills are listed in system-reminder messages"*，且入参 `skill` 是 `z.string()`（**非 enum**）。所以**工具 schema 本身不枚举名单**——"怎么调"永在,"有哪些"全靠通道②那条 reminder。（"名单不进工具描述"是为保最前端 tools 缓存,机制见[《Prompt 缓存机制》](./prompt-cache.md)§5。）下面把两条通道**真实的字**贴出来。
 
 **通道① 的真实内容**——`SkillTool` 在 `<functions>` 里渲染成一个 `<function>`（`tools/SkillTool/prompt.ts` 的 `getPrompt` + `inputSchema` 原文拼出）：
 

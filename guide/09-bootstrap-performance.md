@@ -59,6 +59,8 @@ flowchart LR
 
 ## 4. Prompt 缓存共享：让请求前缀"字节稳定"
 
+> **本节是"性能视角"小结**（memoize 冻结、会话内锁定、破坏检测遥测）。**底层原理（KV 前缀缓存）、cache_control 打点布局（tools★/system★/messages★）、global/org 策略、计费三桶与 API 语义** → 见专题[《Prompt 缓存机制》](./prompt-cache.md)。
+
 省钱省时的大头是 **prompt 缓存**：只要请求的前缀字节稳定，服务端就能命中缓存、跳过重复计算。系统为此做了两件事：
 
 > **先厘清两个"轮"**（下文严格区分，源码为准）：
@@ -102,7 +104,7 @@ flowchart TB
 
 - **只读 param**：`systemPrompt`/`systemContext`/`userContext` 在 `queryLoop` 入口一次解构，全程不再赋值（`query.ts:251-262` 注释明写 immutable）。
 - **连"轮内压缩"都不动它**：若 autocompact 在工具轮之间触发，**只替换 `messagesForQuery = postCompactMessages`**（`query.ts:528-534`，注释 *"Continue on with the current query call using the post compact messages"*），三段前缀原封不动。
-- **什么时候才真会变 = 下一个提交轮**：只有下一次顶层 `query()` 才在 `QueryEngine` 里重新 `fetchSystemPromptParts`。而 `getUserContext`/`getSystemContext` 两个 memoize **仅在 cwd 改 / 压缩生命周期**才 `cache.clear()`（`context.ts:32-33`）；且清缓存只影响"下次调用"——`queryLoop` 循环内**从不重新调**它们，故对**当前提交轮零影响**。所以跨提交轮通常也仍命中，除非 cwd 变了或压缩清了缓存、且底层内容确实不同。
+- **什么时候才真会变 = 下一个提交轮**：只有下一次顶层 `query()` 才在 `QueryEngine` 里重新 `fetchSystemPromptParts`。而 `getUserContext`/`getSystemContext` 两个 memoize **不随 bash `cd` 刷新**——真正 `cache.clear()` 的是**压缩（`compact.ts:63/117/203`）、`/clear`（`caches.ts:52`）、injection 变（`context.ts:32`）**（`claudeMd` 走 `getMemoryFiles`，另由 `/memory`/worktree/resume/启动清）；且清缓存只影响"下次调用"——`queryLoop` 循环内**从不重新调**它们，故对**当前提交轮零影响**。所以跨提交轮通常也仍命中，除非发生上述清缓存事件、且底层内容确实不同。
 - **即便 cwd 变了，system 也不是整段全废——靠"动态边界"隔离**：基座 `systemPrompt`（`getSystemPrompt`，**不 memoize**）每个提交轮现读 `getCwd()`/`env.platform`/OS 重建（`constants/prompts.ts:444,499,642-646`），所以 cwd 改了文本确实变。但系统提示按 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`（`constants/prompts.ts:573`）切两段，`splitSysPromptPrefix`（`utils/api.ts`）据此分块、`buildSystemPromptBlocks`（`claude.ts:3213`）只给静态段打 `cache_control`：
 
 | 段 | 内容 | `cacheScope` | 打 `cache_control`? |
@@ -112,7 +114,7 @@ flowchart TB
 
 > 所以 **cwd 一变，只 churn 边界后那截未缓存的动态尾段，静态大前缀仍命中**。这是"env 有意放边界后"的设计——源码注释：*"Session-variant guidance that would fragment the `cacheScope:'global'` prefix if placed before boundary."*（`constants/prompts.ts:344-345`）。换言之：**`systemPrompt` 会随 cwd/平台变，但变的部分被结构性地挡在缓存边界之外。**
 
-> 一句话：**三段前缀（tools / 冻结的 system+systemContext / 冻结的 userContext）在一个提交轮内逐字节不可变 → 每个工具轮都命中；易变的东西（待办/计划/状态）放尾部 → 变时只废尾部一小段。** 这就是"前缀字节稳定"的具体落地；跨提交轮才可能刷新，且仅在 cwd 改/压缩清缓存时。
+> 一句话：**三段前缀（tools / 冻结的 system+systemContext / 冻结的 userContext）在一个提交轮内逐字节不可变 → 每个工具轮都命中；易变的东西（待办/计划/状态）放尾部 → 变时只废尾部一小段。** 这就是"前缀字节稳定"的具体落地；跨提交轮才可能刷新，且仅在**压缩 / `/clear` / `/memory` / worktree 进出 / resume** 等清缓存事件时（**不含 bash `cd`**）。
 
 ### 4.2 工具在缓存最前端：一变全塌，故拼命防抖
 
@@ -212,7 +214,7 @@ flowchart LR
 
 - 启动入口与预取：`main.tsx`、`bootstrap/`
 - Feature Flag：`bun:bundle` 的 `feature()`（见各处 `feature('X') ? require(...) : null`）
-- Prompt 缓存：`services/api/claude.ts`（`getCacheControl`——tools/system/消息三处 `cache_control`；`addCacheBreakpoints`——每请求一个消息级断点、`markerIndex = skipCacheWrite ? length-2 : length-1` 默认最后一条、fork 前移倒数第二条；§4.3 会话内锁定 `should1hCacheTTL` + `get/setPromptCache1hEligible`/`...Allowlist`、AFK/cachedMC/fast-mode beta 头 sticky-on latch）、`services/api/promptCacheBreakDetection.ts`（**纯事后遥测**：`checkResponseForCacheBreak` 检 `cache_read` 掉幅 → `toolsHash`/`perToolHashes` 逐工具哈希归因 → `tengu_prompt_cache_break` + 写 `.diff`；不阻止失效）、`context.ts`（`getUserContext = memoize`、`getSystemContext = memoize` `:116`、cwd 改/压缩时 `.cache.clear()` `:32-33`）、`utils/api.ts`（`prependUserContext` 前置 `messages[0]` `:449`、`appendSystemContext` 确定性拼接 `:437`）、前缀稳定性 `QueryEngine.ts`（`systemPrompt` 提交轮算一次 `:321`）、系统提示静态/动态切分 `constants/prompts.ts`（`getSystemPrompt` 不 memoize `:444`、`env_info_simple` 动态段 `:499`、`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` `:114/:573`、注释动机 `:344-345`）+ `utils/api.ts`（`splitSysPromptPrefix`：边界前 `cacheScope:'global'`、边界后 `null`）+ `services/api/claude.ts`（`buildSystemPromptBlocks` 只给非 null scope 打 `cache_control` `:3213`）、`query.ts`（`queryLoop` 只读 param「never reassigned during the query loop」`:251-262`、`fullSystemPrompt`=`appendSystemContext` `:450`、`prependUserContext` 调用点 `:660`、轮内压缩只换 messages `:528-534`）
+- Prompt 缓存：`services/api/claude.ts`（`getCacheControl`——tools/system/消息三处 `cache_control`；`addCacheBreakpoints`——每请求一个消息级断点、`markerIndex = skipCacheWrite ? length-2 : length-1` 默认最后一条、fork 前移倒数第二条；§4.3 会话内锁定 `should1hCacheTTL` + `get/setPromptCache1hEligible`/`...Allowlist`、AFK/cachedMC/fast-mode beta 头 sticky-on latch）、`services/api/promptCacheBreakDetection.ts`（**纯事后遥测**：`checkResponseForCacheBreak` 检 `cache_read` 掉幅 → `toolsHash`/`perToolHashes` 逐工具哈希归因 → `tengu_prompt_cache_break` + 写 `.diff`；不阻止失效）、`context.ts`（`getUserContext = memoize`、`getSystemContext = memoize` `:116`；`.cache.clear()` 触发点：injection 变 `:32`、压缩 `compact.ts:63/117/203`、`/clear` `caches.ts:52`——**非 cwd 改**；`claudeMd` 走 `getMemoryFiles`，另由 `/memory`/worktree/resume/启动清 `claudemd.ts:1119`）、`utils/api.ts`（`prependUserContext` 前置 `messages[0]` `:449`、`appendSystemContext` 确定性拼接 `:437`）、前缀稳定性 `QueryEngine.ts`（`systemPrompt` 提交轮算一次 `:321`）、系统提示静态/动态切分 `constants/prompts.ts`（`getSystemPrompt` 不 memoize `:444`、`env_info_simple` 动态段 `:499`、`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` `:114/:573`、注释动机 `:344-345`）+ `utils/api.ts`（`splitSysPromptPrefix`：边界前 `cacheScope:'global'`、边界后 `null`）+ `services/api/claude.ts`（`buildSystemPromptBlocks` 只给非 null scope 打 `cache_control` `:3213`）、`query.ts`（`queryLoop` 只读 param「never reassigned during the query loop」`:251-262`、`fullSystemPrompt`=`appendSystemContext` `:450`、`prependUserContext` 调用点 `:660`、轮内压缩只换 messages `:528-534`）
 - 「轮」的语义：`query.ts`（`while(true)` 每迭代 = 一个 `turn`：`turnCount++`/`transition:'next_turn'` `:1704-1727`；`maxTurns` 计的是工具轮 `:1705`）；提交轮 = 一次 `query()`/`queryLoop`
 - 成本/Token：`cost-tracker.ts`、`services/tokenEstimation.ts`
 - 运行时缓存：`context.ts`（memoize）、`tools/WebFetchTool/utils.ts`（LRU）、`Tool.ts`（文件状态缓存）

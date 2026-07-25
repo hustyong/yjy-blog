@@ -372,13 +372,15 @@ flowchart LR
 | 待办 / 计划 / 记忆附件 / 诊断 / 用量… | **messages 尾部** `<system-reminder>` | 本篇 §3/§5 |
 
 - **前置**：`userContext`（**CLAUDE.md + 日期**，**不是** cwd/git）由 `prependUserContext` 在**每次调模型时**拼**一条** `<system-reminder>` 放 messages **最前**（`isMeta`）。
+  - ⓘ **这里的 `claudeMd` 是"层级合并"的一坨**（`getMemoryFiles`，`claudemd.ts`）：**Managed**（`/etc/claude-code/CLAUDE.md` 策略）→ **User**（`~/.claude/CLAUDE.md` + `~/.claude/rules/*.md`）→ **Project**（**从项目根向下逐层到会话 cwd** 的 `CLAUDE.md`/`.claude/CLAUDE.md`/`.claude/rules/*.md`，`:878` "root downward to CWD"）+ `--add-dir`/`CLAUDE.local.md`。
+  - ⓘ **cwd 之下的子目录 `CLAUDE.md` 不在这条前置里**——它走**嵌套记忆**懒加载：模型**读某子目录的文件**时，`getMemoryFilesForNestedDirectory`（`claudemd.ts:1249` ← `attachments.ts:1832`）才把该层 `CLAUDE.md`+rules 作为**尾部** `<system-reminder>` 附件注入（见 §6.1）。
 - **后置**：本篇各类附件，注入到**最近一条 user 消息**（工具结果之后）。
 - **`systemPrompt` 独立成路**：角色/规则/工具说明 + cwd/平台/OS/日期 + git 状态，走 API 的**独立 `system` 字段**（打 cache_control），既不是前置也不是后置——**三条路，别混**。特别地：**git 在 system 字段（`systemContext`），不在前置 reminder**。
 
 **会不会变（易错，与《08》§4.1 呼应）**：
 
 - **一个提交轮内**：三段前缀全部**逐字节不可变**——`systemPrompt`/`systemContext`/`userContext` 在 `queryLoop` 入口解构为只读 param（注释 *"Immutable params — never reassigned during the query loop."*，`query.ts:251-262`），连轮内压缩都不动。
-- **跨提交轮**：`userContext` 与 `systemContext` 都是 **`memoize`（会话级冻结）**——**不是每次提交跟着环境重读**；**只有 cwd 改 / 压缩**才 `cache.clear()` 刷新（`context.ts:32-33`）。所以 git 状态、日期在会话中途通常**不刷**（跨午夜也不刷，除非清缓存）。而基座 `systemPrompt`（**不 memoize**）每个提交轮**现读 cwd/平台重建**，cwd 改了它确实变——但系统提示按 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 分成**静态段（可缓存）+ 动态段（cwd/平台/OS/git，不打 cache_control）**，cwd 变**只 churn 未缓存的动态尾段、不破静态大前缀**（详见《08》§4.1）。**换言之：`systemPrompt` 会随 cwd/平台变，但变的部分被结构性地挡在缓存边界之外。**
+- **跨提交轮**：`userContext` 与 `systemContext` 都是 **`memoize`（会话级冻结）**——**不是每次提交跟着环境重读**，**尤其 bash `cd` 不会刷新**（agent 的 cwd 在 bash 调用间还会被重置）。真正清缓存的是：`getUserContext`/`getSystemContext` → **压缩（`compact.ts`）、`/clear`（`caches.ts:52`）、injection 变（`context.ts:32`）**；`claudeMd`（`getMemoryFiles`）**另加** `/memory` 编辑、worktree 进出、resume、启动（`memory.tsx`/`Enter`·`ExitWorktreeTool`/`sessionRestore.ts`/`setup.ts:280`）。所以 git 状态、日期在会话中途通常**不刷**（跨午夜也不刷，除非发生上述事件）。而基座 `systemPrompt`（**不 memoize**）每个提交轮**现读 cwd/平台重建**，cwd 改了它确实变——但系统提示按 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 分成**静态段（可缓存）+ 动态段（cwd/平台/OS/git，不打 cache_control）**，cwd 变**只 churn 未缓存的动态尾段、不破静态大前缀**（详见《08》§4.1）。**换言之：`systemPrompt` 会随 cwd/平台变，但变的部分被结构性地挡在缓存边界之外。**
 - **真正每轮都变的动态内容**（待办/计划/记忆浮现/诊断）**不进 system**，走**尾部** `<system-reminder>` 附件——正是为让 `system` 字段稳定可缓存（这也是本篇后置通道存在的根本动机）。
 
 **持久化差别（易错）**：三条路里，只有**前置 `userContext` 真 transient**——
@@ -414,7 +416,7 @@ flowchart LR
 |------|:---:|:---:|------|
 | `systemPrompt`（+ `systemContext`：git 状态）| ❌ | ❌ | 走 API 独立 `system` 字段；基座每提交轮重建，`systemContext` 为 memoize（会话冻结）|
 | `tools` schema | ❌ | ❌ | 走 API 独立 `tools` 参数（→`<functions>`）|
-| **前置 `userContext`**（CLAUDE.md + 日期）| ❌ | ❌ | `prependUserContext` 即时拼、**从不进 `mutableMessages`**；内容为 memoize（会话冻结，cwd 改/压缩才刷）|
+| **前置 `userContext`**（CLAUDE.md 层级合并 + 日期）| ❌ | ❌ | `prependUserContext` 即时拼、**从不进 `mutableMessages`**；内容为 memoize（会话冻结；`cd` 不刷，压缩/`/clear`/`/memory`/worktree/resume 才刷）|
 | **后置各类附件**（待办/计划/记忆/IDE/诊断…）| ✅ | ✅**（受控）** | `QueryEngine` `case 'attachment'` → `recordTranscript`，**进活动上下文并累积** |
 
 > 纠正一个曾经的误解：**`isMeta` ≠ 不落盘**。`isMeta` 只表示"合成消息"，附件仍会落盘。真正 transient 的只有**前置 `userContext`**。
@@ -538,7 +540,7 @@ flowchart TB
 - **有预算**：每次注入约 5 个、每个约 4KB（约 **20KB/提交轮**），另有**会话级上限约 60KB**（≈3 次满注入）兜住整会话总量，避免无限膨胀。
 - **去重**：已读过或本会话已浮现过的不重复注入。
 - **异步预取**：相关记忆改为**异步预取**、主循环消费前等其就绪，避免阻塞。
-- **稳定 header 保缓存**：每条记忆预计算一个稳定头部，减少对 prompt 缓存的扰动。
+- **稳定 header 保缓存**：每条记忆预计算一个稳定头部，减少对 prompt 缓存的扰动。（前缀缓存原理见[《Prompt 缓存机制》](./prompt-cache.md)。）
 
 ---
 

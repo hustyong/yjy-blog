@@ -337,7 +337,7 @@ flowchart LR
     A -->|"SendMessage(to=*)"| BC["广播给所有队友"]
 ```
 
-**记忆/摘要（AgentSummary）**（`services/AgentSummary/`）：对长时间运行的 Agent，系统**周期性**（约 30s）后台生成一段**摘要**——用一个"禁用工具"的分叉 Agent（`canUseTool` 恒 deny，以共享 prompt 缓存）跑一遍，抽取文本作为该任务的摘要，更新到任务状态，供 UI 与协调展示。
+**记忆/摘要（AgentSummary）**（`services/AgentSummary/`）：对长时间运行的 Agent，系统**周期性**（约 30s）后台生成一段**摘要**——用一个"禁用工具"的分叉 Agent（`canUseTool` 恒 deny，以共享 prompt 缓存）跑一遍，抽取文本作为该任务的摘要，更新到任务状态，供 UI 与协调展示。（"禁工具分叉为何能共享缓存"的机制见[《Prompt 缓存机制》](./prompt-cache.md)§7。）
 
 ### 5.1 "多 Agent"到底指哪几种：四种形态
 

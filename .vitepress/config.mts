@@ -12,6 +12,7 @@ const guide = [
   { text: '07 · Hooks 扩展系统', link: '/guide/07-hooks' },
   { text: '08 · 上下文装配与 system-reminder', link: '/guide/08-context-assembly' },
   { text: '09 · 启动与性能', link: '/guide/09-bootstrap-performance' },
+  { text: 'Prompt 缓存机制（专题）', link: '/guide/prompt-cache' },
   { text: '10 · 权限规则系统', link: '/guide/10-permission-rules' },
   { text: '11 · Bash / 命令安全、沙箱与分类器', link: '/guide/11-bash-security' },
 ]
